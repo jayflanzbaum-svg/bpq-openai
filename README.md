@@ -57,8 +57,9 @@ Commands: QRZ <CALL>, QRZ+ <CALL>, BIO <CALL>, MORE, NEW, NODE, HELP.
    ```
    APPLICATION 3,OPENAI,C 7 HOST 0 S,MYCALL-16,NODEAI,255
    ```
-   `C 7` is your Telnet port number; `HOST 0` is the CMDPORT position; the
-   `S` flag makes BPQ send the connecting user's callsign to the app.
+   `C 7` is your Telnet port number; `HOST 0` is the CMDPORT position; `S`
+   returns the user to the node prompt when the app exits. BPQ sends the
+   connecting user's callsign to the app automatically.
 5. Restart BPQ32, start the app (a startup batch file or a Windows Terminal
    tab works well), and type `OPENAI` at your node prompt.
 
