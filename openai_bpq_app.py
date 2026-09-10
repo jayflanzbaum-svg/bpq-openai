@@ -1,6 +1,7 @@
 import os
 import re
 import socket
+import textwrap
 import threading
 import time
 import html as htmlmod
@@ -23,18 +24,32 @@ WELCOME = (
     "Commands: QRZ <CALL>, QRZ+ <CALL>, BIO <CALL>, MORE, NEW, NODE, HELP.\r\n\r\n"
 )
 
+# Grouped one purpose per line, HELP | QUIT last, inside 42 columns - see
+# BPQ-Node/NODE-APP-STYLE.md. This app had no menu at all, so a caller who
+# did not already know QRZ or BIO existed had no way to find them.
+MENU_LINE = ("<question> | QRZ <call> | QRZ+ <call>\r\n"
+             "BIO <call> | MORE | NEW\r\n"
+             "HELP | QUIT\r\n")
+
+# Two columns inside 42: a 13-wide command field, then the gloss.
 HELP = (
-    "OPENAI Help:\r\n"
-    "  - Type any question to ask the AI (any topic).\r\n"
-    "  - QRZ <CALL>       -> short callsign card\r\n"
-    "  - QRZ+ <CALL>      -> extended callsign info (email, etc. if present)\r\n"
-    "  - BIO <CALL>       -> fetch bio text (RF-trimmed)\r\n"
-    "  - MORE             -> continue a long answer\r\n"
-    "  - NEW              -> start a new question (clears context)\r\n"
-    "  - NODE             -> return to the node\r\n\r\n"
+    "Commands:\r\n"
+    "  <question>   ask the AI, any topic\r\n"
+    "  QRZ <call>   short callsign card\r\n"
+    "  QRZ+ <call>  extended callsign info\r\n"
+    "  BIO <call>   bio text, RF-trimmed\r\n"
+    "  MORE         continue a long answer\r\n"
+    "  NEW          new question, clear context\r\n"
+    "  HELP         show commands\r\n"
+    "  Q / BYE / NODE  exit\r\n"
 )
 
-PROMPT_FMT = "[{n} Char. left, type 'MORE' for more, 'NEW' for new question or 'NODE']\r\n"
+# House vocabulary, identical in all four apps. Bare Q was missing here, and
+# it is the one everybody types.
+EXIT_WORDS = ("Q", "QUIT", "EXIT", "BYE", "NODE")
+HELP_WORDS = ("HELP", "?")
+
+PROMPT_FMT = "[{n} left: MORE, NEW, or QUIT]\r\n"
 
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
@@ -440,9 +455,43 @@ def safe_recv_line(conn: socket.socket) -> Optional[str]:
     return line.strip()
 
 
+OUT_WIDTH = 42
+
+
+def wrap_out(text: str, width: int) -> str:
+    """Fold over-long lines at word boundaries for a narrow terminal.
+
+    A phone client is about 43 columns. This app matters more than most: the
+    model returns prose in whatever line lengths it likes, so without this
+    every answer folded mid-word. See BPQ-Node/NODE-APP-STYLE.md.
+    """
+    if width <= 0 or not text:
+        return text
+    out = []
+    for raw in text.replace("\r\n", "\n").splitlines(keepends=True):
+        end = "\n" if raw.endswith("\n") else ""
+        body = raw[:-1] if end else raw
+        if len(body) <= width:
+            out.append(body + end)
+            continue
+        lead = body[:len(body) - len(body.lstrip(" "))]
+        # No added hanging indent here, unlike the apps with tables: this one
+        # emits paragraphs of model prose, and a two-space hang on every
+        # wrapped line makes a paragraph read as a bulleted list.
+        folded = textwrap.wrap(body.strip(), width=width,
+                               initial_indent=lead,
+                               subsequent_indent=lead,
+                               break_long_words=True, break_on_hyphens=False)
+        out.append("\n".join(folded or [body]) + end)
+    return "".join(out)
+
+
 def send(conn: socket.socket, text: str) -> None:
+    # Fold, then sanitize: sanitize_for_bbs restores CRLF and strips anything
+    # non-ASCII, and it is idempotent for text already put through it.
     try:
-        conn.sendall(text.encode("utf-8", errors="ignore"))
+        conn.sendall(sanitize_for_bbs(wrap_out(text, OUT_WIDTH))
+                     .encode("utf-8", errors="ignore"))
     except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
         pass
 
@@ -540,30 +589,35 @@ def handle_client(conn: socket.socket, addr):
 
         cmdline = line.strip()
         up = cmdline.upper()
+        # A blank line under the command the operator just typed, so the
+        # answer reads as a separate block. See NODE-APP-STYLE.md.
+        send(conn, "\r\n")
 
         # NEW: swallow an initial ID/callsign line (like N0CALL-8) so it doesn't get sent to OpenAI
         if _maybe_capture_initial_id(state, cmdline):
-            send(conn, f"Hi {state.user_id}. Ask a question or type HELP.\r\n")
+            send(conn, f"Hi {state.user_id}. Ask me anything.\r\n\r\n"
+                       + MENU_LINE)
             continue
 
-        if up in ("NODE", "BYE", "EXIT", "QUIT"):
-            send(conn, "Returning to node...\r\n")
+        if up in EXIT_WORDS:
+            send(conn, "73!\r\n")
             break
 
-        if up == "HELP":
-            send(conn, HELP)
+        if up in HELP_WORDS:
+            send(conn, HELP + "\r\n" + MENU_LINE)
             continue
 
         if up == "NEW":
             state.pending = ""
             state.last_question = ""
             state.history.clear()
-            send(conn, "OK. New question:\r\n")
+            send(conn, "OK, cleared. New question:\r\n")
             continue
 
         if up == "MORE":
             if not state.pending:
-                send(conn, "Nothing pending. Ask a question or type HELP.\r\n")
+                send(conn, "Nothing more to show. Ask a question, "
+                           "or HELP.\r\n")
                 continue
             next_chunk = state.pending[:CHUNK_LEN]
             state.pending = state.pending[CHUNK_LEN:]
