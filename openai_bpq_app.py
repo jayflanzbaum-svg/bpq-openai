@@ -110,8 +110,8 @@ QRZ_BASE = "https://xmldata.qrz.com/xml/current/"
 # QRZ callsign pattern (no hyphen)
 _CALL_RE = re.compile(r"^[A-Z0-9/]{3,12}$", re.IGNORECASE)
 
-# BPQ/user ID pattern (allows -SSID like N0CALL-8)
-_BPQ_CALL_RE = re.compile(r"^[A-Z0-9/]{3,12}(-\d{1,2})?$", re.IGNORECASE)
+# (No BPQ/user ID pattern here on purpose: BPQ's injected first line is
+# consumed unconditionally, so there is nothing to match it against.)
 
 _qrz_lock = threading.Lock()
 _qrz_session_key: Optional[str] = None
@@ -551,22 +551,19 @@ def _queue_and_send(conn: socket.socket, state: SessionState, text: str) -> None
 
 def _maybe_capture_initial_id(state: SessionState, cmdline: str) -> bool:
     """
-    Some BBS/telnet clients send an ID/callsign immediately on connect (eg "N0CALL-8").
-    If the FIRST non-empty line looks like a callsign (optional -SSID), swallow it.
-    Returns True if we consumed it.
+    BPQ sends the user's callsign as the first line (APPLICATION ... S flag),
+    exactly as it does for the SPOTS/WX/RepeaterSearch apps. Consume it
+    unconditionally, the way those three do. Returns True if we consumed it.
+
+    Pattern-matching it against a callsign regex instead would eat a real
+    first command from anything that connects without sending an ID.
     """
     if state.saw_first_user_line:
         return False
 
-    # Mark that we have now seen the first non-empty line (even if we don't consume it)
     state.saw_first_user_line = True
-
-    # If it looks like a callsign / ID and has no spaces, treat as ID not a question
-    if " " not in cmdline and _BPQ_CALL_RE.match(cmdline.strip()):
-        state.user_id = cmdline.strip().upper()
-        return True
-
-    return False
+    state.user_id = cmdline.strip().upper()
+    return True
 
 
 def handle_client(conn: socket.socket, addr):
@@ -589,15 +586,17 @@ def handle_client(conn: socket.socket, addr):
 
         cmdline = line.strip()
         up = cmdline.upper()
+
+        # Swallow BPQ's injected callsign line before anything is sent back --
+        # including the spacing newline below, which would otherwise go out on
+        # its own. The caller has already been greeted by the node and by
+        # WELCOME, so repeating a greeting and the menu here is wasted airtime.
+        if _maybe_capture_initial_id(state, cmdline):
+            continue
+
         # A blank line under the command the operator just typed, so the
         # answer reads as a separate block. See NODE-APP-STYLE.md.
         send(conn, "\r\n")
-
-        # NEW: swallow an initial ID/callsign line (like N0CALL-8) so it doesn't get sent to OpenAI
-        if _maybe_capture_initial_id(state, cmdline):
-            send(conn, f"Hi {state.user_id}. Ask me anything.\r\n\r\n"
-                       + MENU_LINE)
-            continue
 
         if up in EXIT_WORDS:
             send(conn, "73!\r\n")
